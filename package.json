@@ -1,0 +1,10 @@
+{
+  "name": "opencode-marketplace",
+  "version": "0.1.0",
+  "description": "CLI for browsing and installing community skills, agents, and commands for OpenCode.",
+  "bin": {
+    "ocm": "./bin/ocm.js"
+  },
+  "type": "commonjs",
+  "dependencies": {}
+}
