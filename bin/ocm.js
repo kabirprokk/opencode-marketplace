@@ -12,17 +12,59 @@ const CONFIG_DIR = path.join(os.homedir(), ".config", "opencode");
 const TYPE_TO_DIR = { skill: "skills", agent: "agents", command: "commands" };
 const PACK_DIRS = ["skills", "agents", "commands"];
 const MAX_REGISTRY_BYTES = 2 * 1024 * 1024;
+const REGISTRY_CACHE_PATH = path.join(os.homedir(), ".cache", "opencode-marketplace", "registry.json");
+const REGISTRY_CACHE_TTL_MS = 5 * 60 * 1000;
+const REGISTRY_CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const MANIFEST_PATH = path.join(CONFIG_DIR, ".marketplace", "installed.json");
+const OPENCODE_CONFIG_PATH = path.join(CONFIG_DIR, "opencode.json");
 
-async function fetchRegistry() {
-  const response = await fetch(REGISTRY_URL, { signal: AbortSignal.timeout(12000) });
-  if (!response.ok) throw new Error(`Registry request failed (HTTP ${response.status})`);
-  const text = await response.text();
-  if (Buffer.byteLength(text) > MAX_REGISTRY_BYTES) throw new Error("Registry exceeds 2 MiB limit");
-  const registry = JSON.parse(text);
+function readRegistryCache() {
+  try {
+    const value = JSON.parse(fs.readFileSync(REGISTRY_CACHE_PATH, "utf8"));
+    if (value && typeof value.fetchedAt === "number" && value.registry && Array.isArray(value.registry.packages)) return value;
+  } catch {}
+  return null;
+}
+
+function writeRegistryCache(value) {
+  try {
+    fs.mkdirSync(path.dirname(REGISTRY_CACHE_PATH), { recursive: true });
+    fs.writeFileSync(REGISTRY_CACHE_PATH, JSON.stringify(value), "utf8");
+  } catch {
+    // A cache is only an optimization; a read-only home directory must not
+    // make an otherwise successful registry request fail.
+  }
+}
+
+function validateRegistry(registry) {
   if (!registry || !Array.isArray(registry.packages)) throw new Error("Registry has an invalid format");
   for (const entry of registry.packages) validateEntry(entry);
   return registry;
+}
+
+async function fetchRegistry() {
+  const cached = readRegistryCache();
+  const age = cached ? Date.now() - cached.fetchedAt : Infinity;
+  if (cached && age >= 0 && age < REGISTRY_CACHE_TTL_MS) return validateRegistry(cached.registry);
+  try {
+    const headers = cached && cached.etag ? { "If-None-Match": cached.etag } : {};
+    const response = await fetch(REGISTRY_URL, { headers, signal: AbortSignal.timeout(12000) });
+    if (response.status === 304 && cached) {
+      cached.fetchedAt = Date.now();
+      writeRegistryCache(cached);
+      return validateRegistry(cached.registry);
+    }
+    if (!response.ok) throw new Error(`Registry request failed (HTTP ${response.status})`);
+    const text = await response.text();
+    if (Buffer.byteLength(text) > MAX_REGISTRY_BYTES) throw new Error("Registry exceeds 2 MiB limit");
+    const registry = validateRegistry(JSON.parse(text));
+    const updated = { fetchedAt: Date.now(), etag: response.headers.get("etag"), registry };
+    writeRegistryCache(updated);
+    return registry;
+  } catch (error) {
+    if (cached && age >= 0 && age < REGISTRY_CACHE_MAX_AGE_MS) return validateRegistry(cached.registry);
+    throw error;
+  }
 }
 
 function validateName(name) {
@@ -46,7 +88,7 @@ function validateEntry(entry) {
   if (!entry || typeof entry !== "object") throw new Error("Registry contains an invalid package entry");
   validateName(entry.name);
   validateRepo(entry.repo);
-  if (!TYPE_TO_DIR[entry.type] && entry.type !== "skill-pack") throw new Error(`Unsupported package type: ${entry.type}`);
+  if (!TYPE_TO_DIR[entry.type] && !["skill-pack", "mcp"].includes(entry.type)) throw new Error(`Unsupported package type: ${entry.type}`);
   if (entry.type !== "skill-pack" && entry.path === undefined) throw new Error(`Package ${entry.name} must declare a source path`);
   if (entry.path !== undefined) safeRepoPath("C:\\marketplace-root", entry.path);
   if ([entry.version, entry.description, entry.author, entry.license].some((value) => typeof value !== "string" || !value.trim()) ||
@@ -83,6 +125,85 @@ function saveManifest(manifest) {
   const temp = `${MANIFEST_PATH}.${randomUUID()}.tmp`;
   fs.writeFileSync(temp, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
   fs.renameSync(temp, MANIFEST_PATH);
+}
+
+function updateMcpConfig(name, directory, remove = false) {
+  const jsoncPath = path.join(CONFIG_DIR, "opencode.jsonc");
+  if (remove && !fs.existsSync(OPENCODE_CONFIG_PATH)) return;
+  if (fs.existsSync(jsoncPath) && !fs.existsSync(OPENCODE_CONFIG_PATH)) {
+    throw new Error("Found opencode.jsonc; add this MCP manually because OCM will not rewrite JSONC config");
+  }
+  let config = {};
+  if (fs.existsSync(OPENCODE_CONFIG_PATH)) {
+    try { config = JSON.parse(fs.readFileSync(OPENCODE_CONFIG_PATH, "utf8")); }
+    catch { throw new Error("opencode.json is not valid JSON; refusing to overwrite it"); }
+  }
+  if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("opencode.json must contain a JSON object");
+  if (config.mcp === undefined) config.mcp = {};
+  if (typeof config.mcp !== "object" || Array.isArray(config.mcp)) throw new Error("opencode.json mcp setting must be an object");
+  const servers = config.mcp.servers && typeof config.mcp.servers === "object" && !Array.isArray(config.mcp.servers)
+    ? config.mcp.servers
+    : config.mcp;
+  if (remove) {
+    const current = servers[name];
+    const serverFile = path.join(directory, "server.js");
+    if (current && current.cwd === directory && Array.isArray(current.command) && current.command[0] === process.execPath && current.command[1] === serverFile) {
+      delete servers[name];
+    }
+  } else {
+    if (Object.prototype.hasOwnProperty.call(servers, name)) throw new Error(`MCP config already exists for ${name}; refusing to overwrite it`);
+    servers[name] = { type: "local", command: [process.execPath, path.join(directory, "server.js")], cwd: directory, enabled: true };
+    config.permission ??= {};
+    if (typeof config.permission !== "object" || Array.isArray(config.permission)) throw new Error("opencode.json permission setting must be an object");
+    if (config.permission[`${name}_*`] === undefined) config.permission[`${name}_*`] = "deny";
+    config.agent ??= {};
+    if (typeof config.agent !== "object" || Array.isArray(config.agent)) throw new Error("opencode.json agent setting must be an object");
+    config.agent["mcp-tools"] ??= {
+      description: "Primary agent with access to installed MCP tools.",
+      mode: "primary",
+      prompt: "Use configured MCP tools when they help with the user request.",
+      permission: {},
+    };
+    if (typeof config.agent["mcp-tools"] !== "object" || Array.isArray(config.agent["mcp-tools"])) throw new Error("opencode.json mcp-tools agent must be an object");
+    config.agent["mcp-tools"].permission ??= {};
+    if (typeof config.agent["mcp-tools"].permission !== "object" || Array.isArray(config.agent["mcp-tools"].permission)) throw new Error("mcp-tools agent permission setting must be an object");
+    config.agent["mcp-tools"].permission[`${name}_*`] = "allow";
+  }
+  const temp = `${OPENCODE_CONFIG_PATH}.${randomUUID()}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+  fs.renameSync(temp, OPENCODE_CONFIG_PATH);
+}
+
+function installMcp(item, clonePath) {
+  const source = safeRepoPath(clonePath, item.path);
+  const destination = path.join(CONFIG_DIR, "mcp", item.name);
+  if (fs.existsSync(destination)) throw new Error(`Already installed: ${destination}`);
+  if (fs.existsSync(path.join(CONFIG_DIR, "opencode.jsonc")) && !fs.existsSync(OPENCODE_CONFIG_PATH)) {
+    throw new Error("Found opencode.jsonc; add this MCP manually because OCM will not rewrite JSONC config");
+  }
+  const configFile = path.join(CONFIG_DIR, "opencode.json");
+  if (fs.existsSync(configFile)) {
+    let config;
+    try { config = JSON.parse(fs.readFileSync(configFile, "utf8")); }
+    catch { throw new Error("opencode.json is not valid JSON; refusing to overwrite it"); }
+    const servers = config.mcp?.servers && typeof config.mcp.servers === "object" ? config.mcp.servers : config.mcp;
+    if (servers && Object.prototype.hasOwnProperty.call(servers, item.name)) throw new Error(`MCP config already exists for ${item.name}; refusing to overwrite it`);
+  }
+  stageAndInstall(source, destination);
+  try {
+    const npm = process.platform === "win32" ? "npm.cmd" : "npm";
+    const result = spawnSync(npm, ["ci", "--omit=dev", "--no-audit", "--no-fund"], {
+      cwd: destination, encoding: "utf8", timeout: 120000, windowsHide: true, maxBuffer: 1024 * 1024,
+      shell: process.platform === "win32",
+    });
+    if (result.error) throw new Error(`Could not install MCP dependencies: ${result.error.message}`);
+    if (result.status !== 0) throw new Error((result.stderr || "npm ci failed").trim());
+    updateMcpConfig(item.name, destination);
+    return destination;
+  } catch (error) {
+    fs.rmSync(destination, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function copyTreeSafe(source, destination) {
@@ -165,7 +286,9 @@ function installPackage(registry, name) {
     console.log("Community content is unreviewed. Inspect it before trusting its instructions.");
     cloneRepo(item.repo, clonePath);
 
-    if (item.type === "skill-pack") {
+    if (item.type === "mcp") {
+      installedPaths.push(installMcp(item, clonePath));
+    } else if (item.type === "skill-pack") {
       for (const directory of PACK_DIRS) {
         const sourceDir = path.join(clonePath, directory);
         if (!fs.existsSync(sourceDir)) continue;
@@ -201,7 +324,12 @@ function installPackage(registry, name) {
     for (const installPath of installedPaths) console.log(`Installed: ${installPath}`);
     console.log();
   } catch (error) {
-    for (const installPath of installedPaths) fs.rmSync(installPath, { recursive: true, force: true });
+    for (const installPath of installedPaths) {
+      if (item.type === "mcp") {
+        try { updateMcpConfig(item.name, installPath, true); } catch {}
+      }
+      fs.rmSync(installPath, { recursive: true, force: true });
+    }
     throw error;
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -219,6 +347,9 @@ function cmdRemove(name) {
   let removed = 0;
   for (const relativePath of paths) {
     const target = safeRepoPath(CONFIG_DIR, relativePath);
+    if (relativePath.replaceAll("\\", "/").startsWith("mcp/")) {
+      try { updateMcpConfig(name, target, true); } catch (error) { console.error(`Could not remove MCP config: ${error.message}`); }
+    }
     if (!fs.existsSync(target)) continue;
     fs.rmSync(target, { recursive: true, force: true });
     console.log(`Removed: ${target}`);
@@ -230,7 +361,7 @@ function cmdRemove(name) {
 }
 
 function printHelp() {
-  console.log(`\nOpenCode Community Marketplace CLI (ocm)\n\nUsage:\n  ocm list\n  ocm search <query>\n  ocm info <name>\n  ocm install <name>\n  ocm remove <name>\n\nSkills, agents, and commands are copied into ~/.config/opencode/.\nSkill packs install each available skill, agent, and command without overwriting existing files.\nReview community content before using it.\n\nRegistry: ${REGISTRY_URL}\n`);
+  console.log(`\nOpenCode Community Marketplace CLI (ocm)\n\nUsage:\n  ocm list\n  ocm search <query>\n  ocm info <name>\n  ocm install <name>\n  ocm remove <name>\n\nSkills, agents, and commands are copied into ~/.config/opencode/.\nMCP servers are installed locally and added to opencode.json.\nSkill packs install each available skill, agent, and command without overwriting existing files.\nReview community content before using it.\n\nRegistry: ${REGISTRY_URL}\n`);
 }
 
 async function main(args = process.argv.slice(2)) {

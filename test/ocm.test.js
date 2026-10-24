@@ -20,6 +20,7 @@ test("rejects malformed metadata before CLI commands consume it", () => {
     path: "skills/example", install: "git", tags: ["example"],
   };
   assert.doesNotThrow(() => validateEntry(valid));
+  assert.doesNotThrow(() => validateEntry({ ...valid, name: "example-mcp", type: "mcp", path: "mcp-server" }));
   for (const invalid of [
     { ...valid, author: 5 },
     { ...valid, version: null },
