@@ -1,7 +1,19 @@
 {
-  "name": "opencode-marketplace",
+  "name": "@kabirprokk/opencode-marketplace",
   "version": "0.1.0",
-  "description": "CLI for browsing and installing community skills, agents, and commands for OpenCode.",
+  "description": "Browse and safely install community skills, agents, and commands for OpenCode.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kabirprokk/opencode-marketplace.git"
+  },
+  "homepage": "https://opencode-marketplace-web.vercel.app",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
   "bin": {
     "ocm": "./bin/ocm.js"
   },

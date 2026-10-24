@@ -1,148 +1,258 @@
 #!/usr/bin/env node
+"use strict";
+
 const REGISTRY_URL = "https://raw.githubusercontent.com/kabirprokk/opencode-registry/main/registry.json";
-const fs = require("fs");
-const path = require("path");
-const os = require("os");
-const { execSync } = require("child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const { spawnSync } = require("node:child_process");
+const { randomUUID } = require("node:crypto");
 
 const CONFIG_DIR = path.join(os.homedir(), ".config", "opencode");
-const TYPE_TO_DIR = {
-  skill: "skills",
-  "skill-pack": null,
-  agent: "agents",
-  command: "commands",
-};
+const TYPE_TO_DIR = { skill: "skills", agent: "agents", command: "commands" };
+const PACK_DIRS = ["skills", "agents", "commands"];
+const MAX_REGISTRY_BYTES = 2 * 1024 * 1024;
+const MANIFEST_PATH = path.join(CONFIG_DIR, ".marketplace", "installed.json");
 
-function fetchRegistry() {
-  const https = require("https");
-  return new Promise((resolve, reject) => {
-    https.get(REGISTRY_URL, (res) => {
-      let data = "";
-      res.on("data", (c) => (data += c));
-      res.on("end", () => {
-        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
-      });
-    }).on("error", reject);
-  });
+async function fetchRegistry() {
+  const response = await fetch(REGISTRY_URL, { signal: AbortSignal.timeout(12000) });
+  if (!response.ok) throw new Error(`Registry request failed (HTTP ${response.status})`);
+  const text = await response.text();
+  if (Buffer.byteLength(text) > MAX_REGISTRY_BYTES) throw new Error("Registry exceeds 2 MiB limit");
+  const registry = JSON.parse(text);
+  if (!registry || !Array.isArray(registry.packages)) throw new Error("Registry has an invalid format");
+  for (const entry of registry.packages) validateEntry(entry);
+  return registry;
 }
 
-function ensureDir(d) {
-  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true });
-}
-
-function cmdList(reg) {
-  console.log("\n  OpenCode Marketplace\n");
-  console.log("  " + "NAME".padEnd(22) + "TYPE".padEnd(12) + "VERSION".padEnd(10) + "DESCRIPTION");
-  console.log("  " + "-".repeat(80));
-  for (const p of reg.packages) {
-    console.log("  " + p.name.padEnd(22) + p.type.padEnd(12) + (p.version || "-").padEnd(10) + (p.description || "").slice(0, 50));
+function validateName(name) {
+  if (typeof name !== "string" || !/^[a-z0-9][a-z0-9._-]{0,63}$/i.test(name) || name === "." || name === "..") {
+    throw new Error("Package name is invalid");
   }
-  console.log("\n  " + reg.packages.length + " packages available. Use 'ocm search <query>' or 'ocm install <name>'.\n");
 }
 
-function cmdSearch(reg, query) {
-  const q = query.toLowerCase();
-  const results = reg.packages.filter((p) =>
-    p.name.toLowerCase().includes(q) ||
-    (p.description || "").toLowerCase().includes(q) ||
-    (p.tags || []).some((t) => t.toLowerCase().includes(q))
-  );
-  if (results.length === 0) { console.log('\n  No packages matching "' + query + '".\n'); return; }
-  console.log('\n  Search results for "' + query + '":\n');
-  for (const p of results) {
-    console.log("  " + p.name + " (" + p.type + ") v" + p.version + " — " + p.description);
+function validateRepo(repo) {
+  let url;
+  try { url = new URL(repo); } catch { throw new Error("Package repository URL is invalid"); }
+  if (url.protocol !== "https:" || url.hostname !== "github.com" || url.username || url.password || url.search || url.hash) {
+    throw new Error("Only public HTTPS repositories hosted on github.com are supported");
   }
-  console.log();
+  if (!/^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?\/?$/.test(url.pathname)) {
+    throw new Error("Repository must use the https://github.com/owner/repository URL format");
+  }
 }
 
-function cmdInfo(reg, name) {
-  const p = reg.packages.find((x) => x.name === name);
-  if (!p) { console.log('\n  Package "' + name + '" not found.\n'); return; }
-  console.log("\n  " + p.name);
-  console.log("  " + "=".repeat(p.name.length));
-  console.log("  Type:        " + p.type);
-  console.log("  Version:     " + p.version);
-  console.log("  Author:      " + p.author);
-  console.log("  License:     " + p.license);
-  console.log("  Tags:        " + (p.tags || []).join(", "));
-  console.log("  Description: " + p.description);
-  console.log("  Repo:        " + p.repo);
-  if (p.path) console.log("  Path:        " + p.path);
-  console.log();
+function validateEntry(entry) {
+  if (!entry || typeof entry !== "object") throw new Error("Registry contains an invalid package entry");
+  validateName(entry.name);
+  validateRepo(entry.repo);
+  if (!TYPE_TO_DIR[entry.type] && entry.type !== "skill-pack") throw new Error(`Unsupported package type: ${entry.type}`);
+  if (entry.type !== "skill-pack" && entry.path === undefined) throw new Error(`Package ${entry.name} must declare a source path`);
+  if (entry.path !== undefined) safeRepoPath("C:\\marketplace-root", entry.path);
+  if ([entry.version, entry.description, entry.author, entry.license].some((value) => typeof value !== "string" || !value.trim()) ||
+    !Array.isArray(entry.tags) || entry.tags.some((tag) => typeof tag !== "string" || !tag.trim())) {
+    throw new Error(`Package ${entry.name} has invalid metadata`);
+  }
 }
 
-function cmdInstall(reg, name) {
-  const p = reg.packages.find((x) => x.name === name);
-  if (!p) { console.log('\n  Package "' + name + '" not found.\n'); return; }
-  const dir = TYPE_TO_DIR[p.type];
-  if (dir === undefined) { console.log("\n  Unknown package type: " + p.type + "\n"); return; }
-  const targetDir = dir ? path.join(CONFIG_DIR, dir) : CONFIG_DIR;
-  ensureDir(targetDir);
-  const dest = dir ? path.join(targetDir, name) : path.join(targetDir, name);
-  if (fs.existsSync(dest)) {
-    console.log("\n  " + name + " is already installed at " + dest + ". Use 'ocm remove " + name + "' first.\n");
+function safeRepoPath(root, relativePath) {
+  if (typeof relativePath !== "string" || !relativePath.trim() || path.isAbsolute(relativePath) || /^[A-Za-z]:/.test(relativePath)) {
+    throw new Error("Package path must be a non-empty relative path");
+  }
+  const segments = relativePath.replaceAll("\\", "/").split("/");
+  if (segments.some((segment) => !segment || segment === "." || segment === "..")) throw new Error("Package path contains an unsafe segment");
+  const target = path.resolve(root, ...segments);
+  const rel = path.relative(root, target);
+  if (!rel || rel === ".." || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) throw new Error("Package path escapes the repository");
+  return target;
+}
+
+function ensureDir(directory) {
+  fs.mkdirSync(directory, { recursive: true });
+}
+
+function loadManifest() {
+  try {
+    const value = JSON.parse(fs.readFileSync(MANIFEST_PATH, "utf8"));
+    return value && typeof value === "object" ? value : {};
+  } catch { return {}; }
+}
+
+function saveManifest(manifest) {
+  ensureDir(path.dirname(MANIFEST_PATH));
+  const temp = `${MANIFEST_PATH}.${randomUUID()}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+  fs.renameSync(temp, MANIFEST_PATH);
+}
+
+function copyTreeSafe(source, destination) {
+  const info = fs.lstatSync(source);
+  if (info.isSymbolicLink()) throw new Error(`Refusing symbolic link in package: ${source}`);
+  if (info.isDirectory()) {
+    ensureDir(destination);
+    for (const name of fs.readdirSync(source)) {
+      if (name === ".git") continue;
+      copyTreeSafe(path.join(source, name), path.join(destination, name));
+    }
     return;
   }
-  console.log("\n  Installing " + name + " (" + p.type + ")...");
-  const tmpDir = dest + ".clone";
+  if (!info.isFile()) throw new Error(`Refusing special file in package: ${source}`);
+  ensureDir(path.dirname(destination));
+  fs.copyFileSync(source, destination, fs.constants.COPYFILE_EXCL);
+}
+
+function cmdList(registry) {
+  console.log("\nOpenCode Community Marketplace\n");
+  console.log("NAME".padEnd(24) + "TYPE".padEnd(14) + "VERSION".padEnd(10) + "DESCRIPTION");
+  console.log("-".repeat(88));
+  for (const item of registry.packages) {
+    console.log(item.name.padEnd(24) + item.type.padEnd(14) + String(item.version || "-").padEnd(10) + item.description.slice(0, 50));
+  }
+  console.log(`\n${registry.packages.length} packages. Use 'ocm search <query>' or 'ocm install <name>'.\n`);
+}
+
+function cmdSearch(registry, query) {
+  const q = query.trim().toLocaleLowerCase();
+  const results = registry.packages.filter((item) =>
+    [item.name, item.description, item.author, ...item.tags].some((value) => value.toLocaleLowerCase().includes(q)),
+  );
+  if (!results.length) return console.log(`\nNo packages matching "${query}".\n`);
+  console.log(`\nSearch results for "${query}":\n`);
+  for (const item of results) console.log(`${item.name} (${item.type}) v${item.version} - ${item.description}`);
+  console.log();
+}
+
+function cmdInfo(registry, name) {
+  const item = registry.packages.find((candidate) => candidate.name === name);
+  if (!item) throw new Error(`Package not found: ${name || "(missing name)"}`);
+  console.log(`\n${item.name}\n${"=".repeat(item.name.length)}\nType:        ${item.type}\nVersion:     ${item.version}\nAuthor:      ${item.author}\nLicense:     ${item.license}\nTags:        ${item.tags.join(", ")}\nDescription: ${item.description}\nRepository:  ${item.repo}${item.path ? `\nPath:        ${item.path}` : ""}\n`);
+}
+
+function cloneRepo(repo, destination) {
+  const result = spawnSync("git", ["clone", "--depth", "1", repo, destination], {
+    encoding: "utf8",
+    timeout: 120000,
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error) throw new Error(`Could not run git clone: ${result.error.message}`);
+  if (result.status !== 0) throw new Error((result.stderr || "git clone failed").trim());
+}
+
+function stageAndInstall(source, destination) {
+  if (fs.existsSync(destination)) throw new Error(`Already installed: ${destination}`);
+  const stage = path.join(path.dirname(destination), `.${path.basename(destination)}.install-${randomUUID()}`);
   try {
-    if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
-    execSync("git clone --depth 1 " + p.repo + " " + JSON.stringify(tmpDir), { stdio: "pipe" });
-    const srcPath = p.path ? path.join(tmpDir, p.path) : tmpDir;
-    if (!fs.existsSync(srcPath)) throw new Error("Path " + (p.path || "/") + " not found in repo");
-    fs.cpSync(srcPath, dest, { recursive: true });
-    fs.rmSync(tmpDir, { recursive: true, force: true });
-    console.log("\n  Installed " + name + " to " + dest + "\n");
-  } catch (e) {
-    console.error("\n  Failed to install " + name + ": " + (e.message || e));
-    if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
-    if (fs.existsSync(dest)) fs.rmSync(dest, { recursive: true, force: true });
+    copyTreeSafe(source, stage);
+    fs.renameSync(stage, destination);
+  } catch (error) {
+    fs.rmSync(stage, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function installPackage(registry, name) {
+  validateName(name);
+  const item = registry.packages.find((candidate) => candidate.name === name);
+  if (!item) throw new Error(`Package not found: ${name}`);
+  validateEntry(item);
+
+  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "opencode-market-") );
+  const clonePath = path.join(tempRoot, "source");
+  const installedPaths = [];
+  try {
+    console.log(`\nInstalling ${item.name} (${item.type}) from ${item.repo}`);
+    console.log("Community content is unreviewed. Inspect it before trusting its instructions.");
+    cloneRepo(item.repo, clonePath);
+
+    if (item.type === "skill-pack") {
+      for (const directory of PACK_DIRS) {
+        const sourceDir = path.join(clonePath, directory);
+        if (!fs.existsSync(sourceDir)) continue;
+        for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
+          if (!entry.isDirectory() && !entry.isFile()) continue;
+          if (directory === "skills" && !entry.isDirectory()) continue;
+          if (directory !== "skills" && (!entry.isFile() || !entry.name.endsWith(".md"))) continue;
+          validateName(entry.name);
+          const source = path.join(sourceDir, entry.name);
+          const destination = path.join(CONFIG_DIR, directory, entry.name);
+          if (fs.existsSync(destination)) {
+            console.log(`Skipped existing ${directory}/${entry.name}`);
+            continue;
+          }
+          ensureDir(path.dirname(destination));
+          stageAndInstall(source, destination);
+          installedPaths.push(destination);
+        }
+      }
+      if (!installedPaths.length) throw new Error("No installable skills, agents, or commands were found in this repository");
+    } else {
+      const source = item.path ? safeRepoPath(clonePath, item.path) : clonePath;
+      const filename = item.type === "skill" ? item.name : `${item.name}.md`;
+      const destination = path.join(CONFIG_DIR, TYPE_TO_DIR[item.type], filename);
+      ensureDir(path.dirname(destination));
+      stageAndInstall(source, destination);
+      installedPaths.push(destination);
+    }
+
+    const manifest = loadManifest();
+    manifest[item.name] = installedPaths.map((installPath) => path.relative(CONFIG_DIR, installPath));
+    saveManifest(manifest);
+    for (const installPath of installedPaths) console.log(`Installed: ${installPath}`);
+    console.log();
+  } catch (error) {
+    for (const installPath of installedPaths) fs.rmSync(installPath, { recursive: true, force: true });
+    throw error;
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 }
 
 function cmdRemove(name) {
-  let found = false;
-  const dirs = ["skills", "agents", "commands"];
-  for (const d of dirs) {
-    const dest = path.join(CONFIG_DIR, d, name);
-    if (fs.existsSync(dest)) {
-      fs.rmSync(dest, { recursive: true, force: true });
-      console.log("\n  Removed " + name + " from " + dest + "\n");
-      found = true;
-    }
+  validateName(name);
+  const manifest = loadManifest();
+  const paths = manifest[name];
+  if (!Array.isArray(paths)) {
+    console.log(`\n${name} is not recorded as installed by this CLI; refusing to remove untracked files.\n`);
+    return;
   }
-  if (!found) console.log("\n  " + name + " is not installed.\n");
+  let removed = 0;
+  for (const relativePath of paths) {
+    const target = safeRepoPath(CONFIG_DIR, relativePath);
+    if (!fs.existsSync(target)) continue;
+    fs.rmSync(target, { recursive: true, force: true });
+    console.log(`Removed: ${target}`);
+    removed++;
+  }
+  delete manifest[name];
+  saveManifest(manifest);
+  if (!removed) console.log(`\n${name} is not installed.\n`);
 }
 
-async function main() {
-  const args = process.argv.slice(2);
-  const cmd = args[0];
-  const reg = await fetchRegistry();
+function printHelp() {
+  console.log(`\nOpenCode Community Marketplace CLI (ocm)\n\nUsage:\n  ocm list\n  ocm search <query>\n  ocm info <name>\n  ocm install <name>\n  ocm remove <name>\n\nSkills, agents, and commands are copied into ~/.config/opencode/.\nSkill packs install each available skill, agent, and command without overwriting existing files.\nReview community content before using it.\n\nRegistry: ${REGISTRY_URL}\n`);
+}
 
-  switch (cmd) {
-    case "list": case "ls": cmdList(reg); break;
-    case "search": case "s": cmdSearch(reg, args[1] || ""); break;
-    case "info": cmdInfo(reg, args[1]); break;
-    case "install": case "i": cmdInstall(reg, args[1]); break;
-    case "remove": case "rm": cmdRemove(args[1]); break;
-    case "help": case undefined:
-      console.log(`
-  OpenCode Marketplace CLI (ocm)
+async function main(args = process.argv.slice(2)) {
+  const command = args[0];
+  if (!command || command === "help" || command === "--help" || command === "-h") return printHelp();
+  if (command === "remove" || command === "rm") return cmdRemove(args[1]);
 
-  Usage:
-    ocm list              List all available packages
-    ocm search <query>    Search packages
-    ocm info <name>       Show package details
-    ocm install <name>    Install a package
-    ocm remove <name>     Remove an installed package
-
-  Registry: ${REGISTRY_URL}
-`);
-      break;
-    default:
-      console.error("\n  Unknown command: " + cmd + ". Run 'ocm help' for usage.\n");
-      process.exit(1);
+  const registry = await fetchRegistry();
+  switch (command) {
+    case "list": case "ls": return cmdList(registry);
+    case "search": case "s": return cmdSearch(registry, args.slice(1).join(" "));
+    case "info": return cmdInfo(registry, args[1]);
+    case "install": case "i": return installPackage(registry, args[1]);
+    default: throw new Error(`Unknown command: ${command}. Run 'ocm help'.`);
   }
 }
 
-main().catch((e) => { console.error(e); process.exit(1); });
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`\nError: ${error.message}\n`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { fetchRegistry, validateName, validateRepo, validateEntry, safeRepoPath, copyTreeSafe, installPackage, cmdRemove, main };
