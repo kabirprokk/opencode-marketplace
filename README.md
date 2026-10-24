@@ -38,7 +38,7 @@ installed instructions as untrusted input.
 ## Registry and website
 
 - Registry: https://github.com/kabirprokk/opencode-registry
-- Website: https://opencode-marketplace-web.vercel.app
+- Website: https://ocmskills.vercel.app
 
 ## Development
 
