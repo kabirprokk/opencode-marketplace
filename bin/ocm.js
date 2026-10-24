@@ -8,28 +8,22 @@ const { execSync } = require("child_process");
 const CONFIG_DIR = path.join(os.homedir(), ".config", "opencode");
 const TYPE_TO_DIR = {
   skill: "skills",
-  "skill-pack": "skills",
+  "skill-pack": null,
   agent: "agents",
   command: "commands",
 };
 
 function fetchRegistry() {
-  // Use curl or fetch (Node 18+)
-  try {
-    const https = require("https");
-    return new Promise((resolve, reject) => {
-      https.get(REGISTRY_URL, (res) => {
-        let data = "";
-        res.on("data", (c) => (data += c));
-        res.on("end", () => {
-          try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
-        });
-      }).on("error", reject);
-    });
-  } catch (e) {
-    console.error("Failed to fetch registry:", e.message);
-    process.exit(1);
-  }
+  const https = require("https");
+  return new Promise((resolve, reject) => {
+    https.get(REGISTRY_URL, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+      });
+    }).on("error", reject);
+  });
 }
 
 function ensureDir(d) {
@@ -43,7 +37,7 @@ function cmdList(reg) {
   for (const p of reg.packages) {
     console.log("  " + p.name.padEnd(22) + p.type.padEnd(12) + (p.version || "-").padEnd(10) + (p.description || "").slice(0, 50));
   }
-  console.log(`\n  ${reg.packages.length} packages available. Use 'ocm search <query>' or 'ocm install <name>'.\n`);
+  console.log("\n  " + reg.packages.length + " packages available. Use 'ocm search <query>' or 'ocm install <name>'.\n");
 }
 
 function cmdSearch(reg, query) {
@@ -53,88 +47,71 @@ function cmdSearch(reg, query) {
     (p.description || "").toLowerCase().includes(q) ||
     (p.tags || []).some((t) => t.toLowerCase().includes(q))
   );
-  if (results.length === 0) { console.log(`\n  No packages matching "${query}".\n`); return; }
-  console.log(`\n  Search results for "${query}":\n`);
+  if (results.length === 0) { console.log('\n  No packages matching "' + query + '".\n'); return; }
+  console.log('\n  Search results for "' + query + '":\n');
   for (const p of results) {
-    console.log(`  ${p.name} (${p.type}) v${p.version} — ${p.description}`);
+    console.log("  " + p.name + " (" + p.type + ") v" + p.version + " — " + p.description);
   }
   console.log();
 }
 
 function cmdInfo(reg, name) {
   const p = reg.packages.find((x) => x.name === name);
-  if (!p) { console.log(`\n  Package "${name}" not found.\n`); return; }
+  if (!p) { console.log('\n  Package "' + name + '" not found.\n'); return; }
   console.log("\n  " + p.name);
   console.log("  " + "=".repeat(p.name.length));
-  console.log(`  Type:        ${p.type}`);
-  console.log(`  Version:     ${p.version}`);
-  console.log(`  Author:      ${p.author}`);
-  console.log(`  License:     ${p.license}`);
-  console.log(`  Tags:        ${(p.tags || []).join(", ")}`);
-  console.log(`  Description: ${p.description}`);
-  console.log(`  Repo:        ${p.repo}`);
-  if (p.path) console.log(`  Path:        ${p.path}`);
+  console.log("  Type:        " + p.type);
+  console.log("  Version:     " + p.version);
+  console.log("  Author:      " + p.author);
+  console.log("  License:     " + p.license);
+  console.log("  Tags:        " + (p.tags || []).join(", "));
+  console.log("  Description: " + p.description);
+  console.log("  Repo:        " + p.repo);
+  if (p.path) console.log("  Path:        " + p.path);
   console.log();
 }
 
 function cmdInstall(reg, name) {
   const p = reg.packages.find((x) => x.name === name);
-  if (!p) { console.log(`\n  Package "${name}" not found.\n`); return; }
+  if (!p) { console.log('\n  Package "' + name + '" not found.\n'); return; }
   const dir = TYPE_TO_DIR[p.type];
-  if (!dir) { console.log(`\n  Unknown package type: ${p.type}\n`); return; }
-  const targetDir = path.join(CONFIG_DIR, dir);
+  if (dir === undefined) { console.log("\n  Unknown package type: " + p.type + "\n"); return; }
+  const targetDir = dir ? path.join(CONFIG_DIR, dir) : CONFIG_DIR;
   ensureDir(targetDir);
-  const dest = path.join(targetDir, name);
+  const dest = dir ? path.join(targetDir, name) : path.join(targetDir, name);
   if (fs.existsSync(dest)) {
-    console.log(`\n  ${name} is already installed at ${dest}. Use 'ocm remove ${name}' first to reinstall.\n`);
+    console.log("\n  " + name + " is already installed at " + dest + ". Use 'ocm remove " + name + "' first.\n");
     return;
   }
-  console.log(`\n  Installing ${name} (${p.type})...`);
+  console.log("\n  Installing " + name + " (" + p.type + ")...");
+  const tmpDir = dest + ".clone";
   try {
-    if (p.install === "git") {
-      const cloneUrl = p.repo;
-      const cloneCmd = p.path
-        ? `git clone --depth 1 --filter=blob:none --sparse ${cloneUrl} ${dest} && cd ${dest} && git sparse-checkout set ${p.path}`
-        : `git clone --depth 1 ${cloneUrl} ${dest}`;
-      execSync(cloneCmd, { stdio: "inherit" });
-      // If path specified, move contents up
-      if (p.path) {
-        const srcPath = path.join(dest, p.path);
-        if (fs.existsSync(srcPath)) {
-          const tmpDir = dest + ".tmp";
-          fs.renameSync(srcPath, tmpDir);
-          // remove dest contents except .git
-          for (const f of fs.readdirSync(dest)) {
-            if (f === ".git") continue;
-            const fp = path.join(dest, f);
-            fs.rmSync(fp, { recursive: true, force: true });
-          }
-          for (const f of fs.readdirSync(tmpDir)) {
-            fs.renameSync(path.join(tmpDir, f), path.join(dest, f));
-          }
-          fs.rmSync(tmpDir, { recursive: true, force: true });
-        }
-      }
-    }
-    console.log(`\n  ✓ Installed ${name} to ${dest}\n`);
+    if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
+    execSync("git clone --depth 1 " + p.repo + " " + JSON.stringify(tmpDir), { stdio: "pipe" });
+    const srcPath = p.path ? path.join(tmpDir, p.path) : tmpDir;
+    if (!fs.existsSync(srcPath)) throw new Error("Path " + (p.path || "/") + " not found in repo");
+    fs.cpSync(srcPath, dest, { recursive: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    console.log("\n  Installed " + name + " to " + dest + "\n");
   } catch (e) {
-    console.error(`\n  ✗ Failed to install ${name}: ${e.message}\n`);
+    console.error("\n  Failed to install " + name + ": " + (e.message || e));
+    if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true });
     if (fs.existsSync(dest)) fs.rmSync(dest, { recursive: true, force: true });
   }
 }
 
 function cmdRemove(name) {
-  // Find in any config dir
   let found = false;
-  for (const dir of Object.values(TYPE_TO_DIR)) {
-    const dest = path.join(CONFIG_DIR, dir, name);
+  const dirs = ["skills", "agents", "commands"];
+  for (const d of dirs) {
+    const dest = path.join(CONFIG_DIR, d, name);
     if (fs.existsSync(dest)) {
       fs.rmSync(dest, { recursive: true, force: true });
-      console.log(`\n  ✓ Removed ${name} from ${dest}\n`);
+      console.log("\n  Removed " + name + " from " + dest + "\n");
       found = true;
     }
   }
-  if (!found) console.log(`\n  ${name} is not installed.\n`);
+  if (!found) console.log("\n  " + name + " is not installed.\n");
 }
 
 async function main() {
@@ -163,7 +140,7 @@ async function main() {
 `);
       break;
     default:
-      console.error(`\n  Unknown command: ${cmd}. Run 'ocm help' for usage.\n`);
+      console.error("\n  Unknown command: " + cmd + ". Run 'ocm help' for usage.\n");
       process.exit(1);
   }
 }
